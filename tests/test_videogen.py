@@ -160,3 +160,49 @@ def test_access_control():
     assert not bot.is_allowed(999, allowed)
     assert not bot.is_allowed(None, allowed)
     assert not bot.is_allowed(111, bot.parse_allowed_ids(None))
+
+
+def test_local_plan_fits_frames_and_caps_duration():
+    plan = videogen.make_plan("local", 5, "720p")
+    assert plan.endpoint == "local" and plan.notes == ()
+    assert plan.arguments == {"width": 768, "height": 448, "num_frames": 121}
+    plan = videogen.make_plan("local", 20, "1080p")
+    assert plan.duration == 10 and plan.arguments["num_frames"] % 8 == 1 and len(plan.notes) == 1
+
+
+def test_local_command_swaps_size_for_vertical(monkeypatch):
+    monkeypatch.delenv("LOCAL_AUDIO", raising=False)
+    monkeypatch.setenv("LOCAL_PYTHON", "/venv/bin/python")
+    plan = videogen.make_plan("local", 4, "720p")
+    command = videogen.local_command("a fox", plan, "9:16", "/tmp/o.mp4")
+    assert command[:3] == ["/venv/bin/python", "-m", "mlx_video.models.ltx_2.generate"]
+    args = dict(zip(command[3::2], command[4::2]))
+    assert args == {"--prompt": "a fox", "--width": "448", "--height": "768", "--num-frames": "97",
+                    "--fps": "24", "--model-repo": "prince-canuma/LTX-2-distilled", "--output-path": "/tmp/o.mp4"}
+
+
+def _fake_generator(monkeypatch, body):
+    """Replace the mlx-video command with a tiny script that receives the output path."""
+    monkeypatch.setattr(videogen, "local_command",
+                        lambda prompt, plan, aspect, out: [sys.executable, "-c", body, out])
+
+
+def test_local_generation_returns_the_file_without_touching_fal(monkeypatch):
+    _fake_generator(monkeypatch, "import sys; open(sys.argv[1], 'wb').write(b'mp4')")
+    seen = []
+
+    async def on_status(name):
+        seen.append(name)
+
+    result = run(videogen.generate("a fox", "local", on_status=on_status, client=FakeClient(OK)))
+    assert result.url is None and Path(result.path).read_bytes() == b"mp4"
+    assert seen == ["LocalInProgress"]
+
+
+def test_local_generation_failure_shows_the_error_tail(monkeypatch):
+    _fake_generator(monkeypatch, "import sys; sys.exit('No module named mlx_video')")
+    with pytest.raises(videogen.VideoGenError, match="setup_mac.sh"):
+        run(videogen.generate("a fox", "local"))
+    _fake_generator(monkeypatch, "pass")  # exits 0 but writes nothing
+    with pytest.raises(videogen.VideoGenError):
+        run(videogen.generate("a fox", "local"))

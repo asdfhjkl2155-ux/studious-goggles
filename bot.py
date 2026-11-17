@@ -8,6 +8,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import shutil
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -30,6 +31,8 @@ STATUS_TEXT = {
     "Queued": "⏳ الطلب في قائمة الانتظار…",
     "InProgress": "🎬 جاري توليد الفيديو… (قد يأخذ من 1 إلى 5 دقائق)",
     "Completed": "✅ اكتمل التوليد، جاري الإرسال…",
+    "LocalQueued": "⏳ يوجد توليد محلي جارٍ، طلبك التالي في الدور…",
+    "LocalInProgress": "🎬 جاري التوليد على الماك… (قد يأخذ عدة دقائق أو أكثر حسب الجهاز والمدة)",
 }
 
 HELP = (
@@ -46,6 +49,7 @@ HELP = (
 )
 
 AUTO_LABEL = "تلقائي — الأنسب للمدة والجودة"
+MODEL_NAMES = {videogen.AUTO: AUTO_LABEL, videogen.LOCAL: videogen.LOCAL_LABEL}
 
 
 def parse_allowed_ids(raw: str | None) -> set[int]:
@@ -73,7 +77,7 @@ def describe(settings: dict) -> str:
         f"المدة: {settings['duration']} ثانية",
         f"الجودة: {settings['quality']}",
         f"المقاس: {settings['aspect']}",
-        f"الموديل: {AUTO_LABEL if settings['model'] == videogen.AUTO else settings['model']}",
+        f"الموديل: {MODEL_NAMES.get(settings['model'], settings['model'])}",
     ]
     try:
         plan = videogen.make_plan(settings["model"], settings["duration"], settings["quality"])
@@ -163,13 +167,15 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if context.args:  # /model <short name or full fal endpoint id>
         if not videogen.is_known_model(context.args[0]):
             await update.message.reply_text(
-                f"موديل غير معروف. المتاح: {videogen.AUTO}, {', '.join(videogen.MODELS)} أو معرّف endpoint من fal."
+                f"موديل غير معروف. المتاح: {videogen.AUTO}, {videogen.LOCAL}, "
+                f"{', '.join(videogen.MODELS)} أو معرّف endpoint من fal."
             )
             return
         settings["model"] = context.args[0]
         await update.message.reply_text(describe(settings))
         return
-    options = [(videogen.AUTO, AUTO_LABEL)] + [(key, spec.label) for key, spec in videogen.MODELS.items()]
+    options = [(videogen.AUTO, AUTO_LABEL), (videogen.LOCAL, videogen.LOCAL_LABEL)]
+    options += [(key, spec.label) for key, spec in videogen.MODELS.items()]
     await update.message.reply_text(
         "اختر موديل، أو اكتب /model متبوعاً بمعرّف endpoint من fal:",
         reply_markup=_keyboard("model", options, settings["model"]),
@@ -183,7 +189,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     kind, _, value = (query.data or "").partition(":")
     settings = _settings(context)
-    if kind == "model" and (value == videogen.AUTO or value in videogen.MODELS):
+    if kind == "model" and (value in MODEL_NAMES or value in videogen.MODELS):
         settings["model"] = value
     elif kind == "aspect" and value in videogen.ASPECT_RATIOS:
         settings["aspect"] = value
@@ -228,7 +234,12 @@ async def on_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     caption = "\n".join([prompt, f"— {result.plan.label}", *(f"⚠️ {note}" for note in result.notes)])
     try:
         await message.chat.send_action(ChatAction.UPLOAD_VIDEO)
-        data = await videogen.download(result.url)
+        if result.path:
+            with open(result.path, "rb") as fh:
+                data = fh.read()
+            shutil.rmtree(os.path.dirname(result.path), ignore_errors=True)
+        else:
+            data = await videogen.download(result.url)
         if data is None:
             await message.reply_text(f"الفيديو أكبر من حد تيليجرام (50MB). رابط التحميل:\n{result.url}")
         else:
@@ -243,7 +254,8 @@ async def on_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await status_msg.delete()
     except Exception:
         log.exception("delivery failed")
-        await status_msg.edit_text(f"تم توليد الفيديو لكن تعذّر رفعه. رابط التحميل:\n{result.url}")
+        where = f"رابط التحميل:\n{result.url}" if result.url else "راجع سجل البوت."
+        await status_msg.edit_text(f"تم توليد الفيديو لكن تعذّر رفعه. {where}")
 
 
 def build_app() -> Application:
@@ -252,7 +264,7 @@ def build_app() -> Application:
     if not token:
         raise SystemExit("TELEGRAM_BOT_TOKEN is missing. Copy .env.example to .env and fill it in.")
     if not os.environ.get("FAL_KEY"):
-        raise SystemExit("FAL_KEY is missing. Copy .env.example to .env and fill it in.")
+        log.warning("FAL_KEY is empty: only the local model (/model local) will work.")
     allowed = parse_allowed_ids(os.environ.get("ALLOWED_USER_IDS"))
     if not allowed:
         log.warning("ALLOWED_USER_IDS is empty: nobody can generate yet. Send /id to the bot to get your id.")

@@ -4,3 +4,4 @@ venv/
 __pycache__/
 .pytest_cache/
 *.mp4
+test_video.mp4

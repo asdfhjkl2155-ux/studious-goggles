@@ -3,6 +3,7 @@
 Usable as a library (the Telegram bot imports it) or directly from the terminal:
 
     python videogen.py "a red fox running through snow at sunrise" --duration 10 --quality 1080p
+    python videogen.py "a red fox running through snow at sunrise" --model local
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import argparse
 import asyncio
 import os
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -45,7 +47,17 @@ MODELS: dict[str, ModelSpec] = {
         send_resolution=False,
     ),
 }
-AUTO = "auto"  # pick the model that best fits the requested duration and quality
+AUTO = "auto"  # pick the fal model that best fits the requested duration and quality
+
+# "local": LTX-2 running on this Mac through mlx-video (Apple Silicon only, see setup_mac.sh).
+# Free and unmetered, but slower and lower-resolution than the fal models.
+LOCAL = "local"
+LOCAL_LABEL = "LTX-2 محلي على الماك — مجاني"
+LOCAL_FPS = 24
+LOCAL_DURATIONS = tuple(range(3, 11))  # memory use grows with length; 10s is a safe ceiling
+LOCAL_SIZES = {"720p": (768, 448), "1080p": (1280, 704)}  # (width, height), multiples of 64
+LOCAL_MODEL_REPO = "prince-canuma/LTX-2-distilled"  # weights pre-converted for MLX
+_local_lock = asyncio.Lock()  # one local generation at a time: two would exhaust memory
 DEFAULT_MODEL = AUTO
 ASPECT_RATIOS = ("16:9", "9:16")
 QUALITIES = ("720p", "1080p")
@@ -76,8 +88,9 @@ class Plan:
 
 @dataclass(frozen=True)
 class VideoResult:
-    url: str
     plan: Plan
+    url: str | None = None  # fal models: where the video can be downloaded
+    path: str | None = None  # local model: the generated file on this machine
     notes: tuple[str, ...] = field(default=())
 
 
@@ -86,7 +99,7 @@ def _nearest(options: tuple[int, ...], wanted: int) -> int:
 
 
 def is_known_model(model: str) -> bool:
-    return model == AUTO or model in MODELS or "/" in model
+    return model in (AUTO, LOCAL) or model in MODELS or "/" in model
 
 
 def make_plan(model: str, duration: int, quality: str) -> Plan:
@@ -97,10 +110,23 @@ def make_plan(model: str, duration: int, quality: str) -> Plan:
     if not MIN_DURATION <= duration <= MAX_DURATION:
         raise VideoGenError(f"المدة يجب أن تكون بين {MIN_DURATION} و {MAX_DURATION} ثانية.")
 
+    if model == LOCAL:
+        notes = []
+        actual = _nearest(LOCAL_DURATIONS, duration)
+        if actual != duration:
+            notes.append(f"تم تعديل المدة من {duration} إلى {actual} ثانية "
+                         f"(أقصى مدة للموديل المحلي {max(LOCAL_DURATIONS)} ثوانٍ).")
+        width, height = LOCAL_SIZES[quality]
+        # LTX-2 needs 1 + 8*k frames.
+        frames = round(actual * LOCAL_FPS / 8) * 8 + 1
+        return Plan(LOCAL, f"{LOCAL_LABEL} ({width}×{height})",
+                    {"width": width, "height": height, "num_frames": frames}, actual, quality, tuple(notes))
+
     if model not in MODELS and model != AUTO:
         if "/" not in model:
             raise VideoGenError(
-                f"موديل غير معروف: {model}. المتاح: {AUTO}, {', '.join(MODELS)} أو معرّف endpoint كامل من fal."
+                f"موديل غير معروف: {model}. المتاح: {AUTO}, {LOCAL}, {', '.join(MODELS)} "
+                "أو معرّف endpoint كامل من fal."
             )
         # A raw endpoint id: its schema is unknown, so leave duration/quality to its defaults.
         return Plan(model, model, {}, None, None,
@@ -156,6 +182,54 @@ def extract_video_url(result: Any) -> str | None:
     return None
 
 
+def local_command(prompt: str, plan: Plan, aspect_ratio: str, output_path: str) -> list[str]:
+    """The mlx-video command line for one local generation."""
+    width, height = plan.arguments["width"], plan.arguments["height"]
+    if aspect_ratio == "9:16":
+        width, height = height, width
+    command = [
+        os.environ.get("LOCAL_PYTHON") or sys.executable, "-m", "mlx_video.models.ltx_2.generate",
+        "--prompt", prompt,
+        "--width", str(width), "--height", str(height),
+        "--num-frames", str(plan.arguments["num_frames"]), "--fps", str(LOCAL_FPS),
+        "--model-repo", os.environ.get("LOCAL_MODEL_REPO") or LOCAL_MODEL_REPO,
+        "--output-path", output_path,
+    ]
+    if os.environ.get("LOCAL_AUDIO") == "1":
+        command.append("--audio")
+    return command
+
+
+async def _generate_local(
+    prompt: str, plan: Plan, aspect_ratio: str, on_status: StatusCallback | None
+) -> VideoResult:
+    output_path = os.path.join(tempfile.mkdtemp(prefix="videobot-"), "video.mp4")
+    command = local_command(prompt, plan, aspect_ratio, output_path)
+    timeout = int(os.environ.get("LOCAL_TIMEOUT_SECONDS") or 3600)
+    if on_status and _local_lock.locked():
+        await on_status("LocalQueued")
+    async with _local_lock:
+        if on_status:
+            await on_status("LocalInProgress")
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+            )
+        except OSError as exc:
+            raise VideoGenError(f"تعذّر تشغيل الموديل المحلي: {exc}") from exc
+        try:
+            _, stderr = await asyncio.wait_for(process.communicate(), timeout)
+        except asyncio.TimeoutError as exc:
+            process.kill()
+            await process.wait()
+            raise VideoGenError(f"تجاوز التوليد المحلي المهلة ({timeout // 60} دقيقة).") from exc
+    if process.returncode != 0 or not os.path.isfile(output_path) or not os.path.getsize(output_path):
+        tail = (stderr or b"").decode(errors="replace").strip()[-600:]
+        hint = " شغّل setup_mac.sh أولاً." if "No module named" in tail else ""
+        raise VideoGenError(f"فشل التوليد المحلي.{hint}\n{tail}".strip())
+    return VideoResult(plan=plan, path=output_path, notes=plan.notes)
+
+
 async def generate(
     prompt: str,
     model: str = DEFAULT_MODEL,
@@ -172,6 +246,8 @@ async def generate(
     if aspect_ratio not in ASPECT_RATIOS:
         raise VideoGenError(f"مقاس غير مدعوم: {aspect_ratio}. المتاح: {', '.join(ASPECT_RATIOS)}")
     plan = make_plan(model, duration, quality)
+    if plan.endpoint == LOCAL:
+        return await _generate_local(prompt, plan, aspect_ratio, on_status)
 
     if client is None:
         if not os.environ.get("FAL_KEY"):
@@ -214,7 +290,7 @@ async def generate(
     url = extract_video_url(result)
     if not url:
         raise VideoGenError("انتهى التوليد لكن الخدمة لم ترجع رابط فيديو.")
-    return VideoResult(url=url, plan=plan, notes=tuple(notes))
+    return VideoResult(plan=plan, url=url, notes=tuple(notes))
 
 
 async def download(url: str, max_bytes: int = MAX_DOWNLOAD_BYTES) -> bytes | None:
@@ -255,12 +331,16 @@ async def _cli() -> int:
         return 1
     for note in result.notes:
         print(f"Note: {note}", file=sys.stderr)
-    print(result.url)
-    data = await download(result.url, max_bytes=2**31)
-    if data:
+    if result.path:
+        os.replace(result.path, args.out)
+    else:
+        print(result.url)
+        data = await download(result.url, max_bytes=2**31)
+        if not data:
+            return 1
         with open(args.out, "wb") as fh:
             fh.write(data)
-        print(f"Saved to {args.out}", file=sys.stderr)
+    print(f"Saved to {args.out}", file=sys.stderr)
     return 0
 
 
