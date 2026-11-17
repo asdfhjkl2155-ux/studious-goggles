@@ -33,14 +33,19 @@ STATUS_TEXT = {
 }
 
 HELP = (
-    "اكتب وصف الفيديو في رسالة وسأولّده لك.\n\n"
+    "اكتب وصف الفيديو في رسالة وسأولّده لك بالإعدادات الحالية.\n\n"
     "الأوامر:\n"
-    "/model — اختيار موديل التوليد\n"
-    "/aspect — مقاس الفيديو (أفقي 16:9 أو عمودي 9:16)\n"
+    "/duration — مدة الفيديو (من 3 إلى 20 ثانية)\n"
+    "/quality — الجودة (720p أو 1080p)\n"
+    "/aspect — المقاس (أفقي 16:9 أو عمودي 9:16)\n"
+    "/model — الموديل (الافتراضي: اختيار تلقائي حسب المدة والجودة)\n"
+    "/settings — عرض الإعدادات الحالية\n"
     "/id — عرض رقم حسابك في تيليجرام\n\n"
     "نصيحة: الوصف بالإنجليزية وبتفاصيل واضحة (المشهد، الحركة، الإضاءة، زاوية الكاميرا) "
     "يعطي نتيجة أفضل."
 )
+
+AUTO_LABEL = "تلقائي — الأنسب للمدة والجودة"
 
 
 def parse_allowed_ids(raw: str | None) -> set[int]:
@@ -57,7 +62,26 @@ def _settings(context: ContextTypes.DEFAULT_TYPE) -> dict:
     data = context.user_data
     data.setdefault("model", os.environ.get("DEFAULT_MODEL", videogen.DEFAULT_MODEL))
     data.setdefault("aspect", "16:9")
+    data.setdefault("duration", videogen.DEFAULT_DURATION)
+    data.setdefault("quality", videogen.DEFAULT_QUALITY)
     return data
+
+
+def describe(settings: dict) -> str:
+    """The current settings plus what they will actually produce."""
+    lines = [
+        f"المدة: {settings['duration']} ثانية",
+        f"الجودة: {settings['quality']}",
+        f"المقاس: {settings['aspect']}",
+        f"الموديل: {AUTO_LABEL if settings['model'] == videogen.AUTO else settings['model']}",
+    ]
+    try:
+        plan = videogen.make_plan(settings["model"], settings["duration"], settings["quality"])
+    except videogen.VideoGenError as exc:
+        return "\n".join(lines + [f"⚠️ {exc}"])
+    if settings["model"] == videogen.AUTO:
+        lines.append(f"سيُستخدم: {plan.label}")
+    return "\n".join(lines + [f"⚠️ {note}" for note in plan.notes])
 
 
 async def _guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -72,13 +96,64 @@ async def _guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return False
 
 
+def _keyboard(kind: str, options: list[tuple[str, str]], current: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(("● " if value == current else "") + label, callback_data=f"{kind}:{value}")]
+        for value, label in options
+    ])
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await _guard(update, context):
-        await update.message.reply_text("أهلاً 👋\n" + HELP)
+        await update.message.reply_text(f"أهلاً 👋\n{HELP}\n\nالإعدادات الحالية:\n{describe(_settings(context))}")
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _guard(update, context):
+        await update.message.reply_text(describe(_settings(context)))
 
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"رقم حسابك: {update.effective_user.id}")
+
+
+async def cmd_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update, context):
+        return
+    settings = _settings(context)
+    if context.args:  # /duration 12
+        value = context.args[0]
+        if not value.isdigit() or not videogen.MIN_DURATION <= int(value) <= videogen.MAX_DURATION:
+            await update.message.reply_text(
+                f"اكتب رقماً بين {videogen.MIN_DURATION} و {videogen.MAX_DURATION}، مثال: /duration 12"
+            )
+            return
+        settings["duration"] = int(value)
+        await update.message.reply_text(describe(settings))
+        return
+    options = [(str(d), f"{d} ثانية") for d in videogen.DURATION_CHOICES]
+    await update.message.reply_text(
+        "اختر مدة الفيديو، أو اكتب /duration متبوعاً بعدد الثواني:",
+        reply_markup=_keyboard("duration", options, str(settings["duration"])),
+    )
+
+
+async def cmd_quality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update, context):
+        return
+    options = [("720p", "720p — HD، أسرع وأرخص"), ("1080p", "1080p — Full HD")]
+    await update.message.reply_text(
+        "اختر الجودة:", reply_markup=_keyboard("quality", options, _settings(context)["quality"])
+    )
+
+
+async def cmd_aspect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _guard(update, context):
+        return
+    options = [("16:9", "أفقي 16:9 (يوتيوب)"), ("9:16", "عمودي 9:16 (Reels / Shorts)")]
+    await update.message.reply_text(
+        "اختر المقاس:", reply_markup=_keyboard("aspect", options, _settings(context)["aspect"])
+    )
 
 
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -86,31 +161,18 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     settings = _settings(context)
     if context.args:  # /model <short name or full fal endpoint id>
-        try:
-            videogen.resolve_endpoint(context.args[0])
-        except videogen.VideoGenError as exc:
-            await update.message.reply_text(str(exc))
+        if not videogen.is_known_model(context.args[0]):
+            await update.message.reply_text(
+                f"موديل غير معروف. المتاح: {videogen.AUTO}, {', '.join(videogen.MODELS)} أو معرّف endpoint من fal."
+            )
             return
         settings["model"] = context.args[0]
-        await update.message.reply_text(f"تم اختيار الموديل: {context.args[0]}")
+        await update.message.reply_text(describe(settings))
         return
-    buttons = [
-        [InlineKeyboardButton(("● " if key == settings["model"] else "") + label, callback_data=f"model:{key}")]
-        for key, (_, label) in videogen.MODELS.items()
-    ]
+    options = [(videogen.AUTO, AUTO_LABEL)] + [(key, spec.label) for key, spec in videogen.MODELS.items()]
     await update.message.reply_text(
-        f"الموديل الحالي: {settings['model']}\nاختر موديل، أو اكتب /model متبوعاً بمعرّف endpoint من fal:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
-
-
-async def cmd_aspect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await _guard(update, context):
-        return
-    labels = {"16:9": "أفقي 16:9 (يوتيوب)", "9:16": "عمودي 9:16 (Reels / Shorts)"}
-    buttons = [[InlineKeyboardButton(labels[a], callback_data=f"aspect:{a}")] for a in videogen.ASPECT_RATIOS]
-    await update.message.reply_text(
-        f"المقاس الحالي: {_settings(context)['aspect']}", reply_markup=InlineKeyboardMarkup(buttons)
+        "اختر موديل، أو اكتب /model متبوعاً بمعرّف endpoint من fal:",
+        reply_markup=_keyboard("model", options, settings["model"]),
     )
 
 
@@ -121,12 +183,17 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     kind, _, value = (query.data or "").partition(":")
     settings = _settings(context)
-    if kind == "model" and value in videogen.MODELS:
+    if kind == "model" and (value == videogen.AUTO or value in videogen.MODELS):
         settings["model"] = value
-        await query.edit_message_text(f"تم اختيار الموديل: {videogen.MODELS[value][1]}")
     elif kind == "aspect" and value in videogen.ASPECT_RATIOS:
         settings["aspect"] = value
-        await query.edit_message_text(f"تم اختيار المقاس: {value}")
+    elif kind == "quality" and value in videogen.QUALITIES:
+        settings["quality"] = value
+    elif kind == "duration" and value.isdigit() and int(value) in videogen.DURATION_CHOICES:
+        settings["duration"] = int(value)
+    else:
+        return
+    await query.edit_message_text("تم الحفظ ✅\n" + describe(settings))
 
 
 async def on_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -145,7 +212,10 @@ async def on_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 log.debug("status edit failed", exc_info=True)
 
     try:
-        result = await videogen.generate(message.text, settings["model"], settings["aspect"], on_status)
+        result = await videogen.generate(
+            message.text, settings["model"], settings["aspect"],
+            settings["duration"], settings["quality"], on_status,
+        )
     except videogen.VideoGenError as exc:
         await status_msg.edit_text(f"❌ {exc}")
         return
@@ -154,7 +224,8 @@ async def on_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await status_msg.edit_text("❌ حدث خطأ غير متوقع أثناء التوليد. راجع سجل البوت.")
         return
 
-    caption = message.text if len(message.text) <= 900 else message.text[:900] + "…"
+    prompt = message.text if len(message.text) <= 700 else message.text[:700] + "…"
+    caption = "\n".join([prompt, f"— {result.plan.label}", *(f"⚠️ {note}" for note in result.notes)])
     try:
         await message.chat.send_action(ChatAction.UPLOAD_VIDEO)
         data = await videogen.download(result.url)
@@ -190,9 +261,12 @@ def build_app() -> Application:
     app = ApplicationBuilder().token(token).concurrent_updates(True).build()
     app.bot_data["allowed"] = allowed
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
+    app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("id", cmd_id))
-    app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CommandHandler("duration", cmd_duration))
+    app.add_handler(CommandHandler("quality", cmd_quality))
     app.add_handler(CommandHandler("aspect", cmd_aspect))
+    app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_prompt))
     return app
