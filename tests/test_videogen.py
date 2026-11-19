@@ -206,3 +206,16 @@ def test_local_generation_failure_shows_the_error_tail(monkeypatch):
     _fake_generator(monkeypatch, "pass")  # exits 0 but writes nothing
     with pytest.raises(videogen.VideoGenError):
         run(videogen.generate("a fox", "local"))
+
+
+def test_pairing_code_claims_owner_once_and_saves_it(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("TELEGRAM_BOT_TOKEN=x\nALLOWED_USER_IDS=\n")
+    data = {"allowed": set(), "pairing_code": "AB12CD", "env_path": str(env)}
+    assert not bot.claim_owner("wrong", 1, data)
+    assert not bot.claim_owner("ab12cd", None, data)
+    assert bot.claim_owner(" ab12cd ", 42, data)
+    assert data["allowed"] == {42} and data["pairing_code"] is None
+    assert "ALLOWED_USER_IDS=42" in env.read_text()
+    assert not bot.claim_owner("AB12CD", 99, data)  # the code works only once
+    assert data["allowed"] == {42}

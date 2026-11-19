@@ -99,6 +99,6 @@ cat <<'DONE'
   1. احفظ المفاتيح:   venv/bin/python set_keys.py
      (token البوت من @BotFather، ومفتاح fal من fal.ai)
   2. شغّل البوت:   caffeinate -i venv/bin/python bot.py
-  3. أرسل /id للبوت، ضع الرقم في ALLOWED_USER_IDS داخل .env، ثم أعد تشغيل البوت.
+  3. سيظهر "رمز الربط" في Terminal: أرسله للبوت في تيليجرام ليصبح حسابك هو المالك.
   4. اكتب وصف الفيديو في رسالة.
 DONE

@@ -8,9 +8,10 @@ from __future__ import annotations
 import io
 import logging
 import os
+import secrets
 import shutil
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -88,10 +89,36 @@ def describe(settings: dict) -> str:
     return "\n".join(lines + [f"⚠️ {note}" for note in plan.notes])
 
 
+def claim_owner(text: str | None, user_id: int | None, bot_data: dict) -> bool:
+    """First run: whoever sends the pairing code printed in the terminal becomes the owner.
+
+    Only someone looking at the machine running the bot can see the code, so a stranger who
+    finds the bot in Telegram cannot claim it.
+    """
+    code = bot_data.get("pairing_code")
+    if not code or user_id is None or (text or "").strip().upper() != code:
+        return False
+    bot_data["allowed"].add(user_id)
+    bot_data["pairing_code"] = None
+    env_path = bot_data.get("env_path")
+    if env_path:
+        set_key(env_path, "ALLOWED_USER_IDS", ",".join(map(str, sorted(bot_data["allowed"]))),
+                quote_mode="never")
+    return True
+
+
 async def _guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
     if is_allowed(user.id if user else None, context.bot_data["allowed"]):
         return True
+    message = update.effective_message
+    if message and claim_owner(message.text, user.id if user else None, context.bot_data):
+        log.info("Owner paired: %s", user.id)
+        await message.reply_text("✅ تم ربط حسابك بالبوت. أنت الآن المالك.\n\n" + HELP)
+        return False  # the pairing message itself is not a video prompt
+    if context.bot_data.get("pairing_code") and message:
+        await message.reply_text("أرسل رمز الربط الظاهر في نافذة Terminal على جهازك.")
+        return False
     if update.effective_message:
         await update.effective_message.reply_text(
             "هذا بوت خاص. إن كنت صاحبه، أضف رقمك إلى ALLOWED_USER_IDS في ملف .env "
@@ -264,14 +291,24 @@ def build_app() -> Application:
     if not token:
         raise SystemExit("TELEGRAM_BOT_TOKEN is missing. Copy .env.example to .env and fill it in.")
     if not os.environ.get("FAL_KEY"):
-        log.warning("FAL_KEY is empty: only the local model (/model local) will work.")
+        print("تنبيه: مفتاح fal فارغ، فلن يولّد البوت فيديو حتى تضيفه بالأمر: venv/bin/python set_keys.py ثم تعيد تشغيل البوت.", flush=True)
     allowed = parse_allowed_ids(os.environ.get("ALLOWED_USER_IDS"))
+    pairing_code = None
     if not allowed:
-        log.warning("ALLOWED_USER_IDS is empty: nobody can generate yet. Send /id to the bot to get your id.")
+        pairing_code = secrets.token_hex(3).upper()
+        print(
+            "\n" + "=" * 50
+            + f"\n  رمز الربط: {pairing_code}"
+            + "\n  أرسل هذا الرمز للبوت في تيليجرام ليصبح حسابك هو المالك."
+            + "\n" + "=" * 50 + "\n",
+            flush=True,
+        )
 
     # concurrent_updates: a multi-minute generation must not block the next message.
     app = ApplicationBuilder().token(token).concurrent_updates(True).build()
     app.bot_data["allowed"] = allowed
+    app.bot_data["pairing_code"] = pairing_code
+    app.bot_data["env_path"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
     app.add_handler(CommandHandler(["start", "help"], cmd_start))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("id", cmd_id))
@@ -287,4 +324,6 @@ def build_app() -> Application:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)  # its INFO lines include the bot token in URLs
-    build_app().run_polling(allowed_updates=Update.ALL_TYPES)
+    app = build_app()
+    print("البوت يعمل الآن. اتركه مفتوحاً. للإيقاف: Control + C", flush=True)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
