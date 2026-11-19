@@ -96,8 +96,8 @@ fi
 cat <<'DONE'
 
 تم التثبيت. الخطوات الباقية:
-  1. افتح ملف .env بالأمر:   open -e .env
-     وضع TELEGRAM_BOT_TOKEN (من @BotFather)، و FAL_KEY (من fal.ai) إذا كنت على وضع fal، ثم احفظ.
+  1. احفظ المفاتيح:   venv/bin/python set_keys.py
+     (token البوت من @BotFather، ومفتاح fal من fal.ai)
   2. شغّل البوت:   caffeinate -i venv/bin/python bot.py
   3. أرسل /id للبوت، ضع الرقم في ALLOWED_USER_IDS داخل .env، ثم أعد تشغيل البوت.
   4. اكتب وصف الفيديو في رسالة.
