@@ -86,6 +86,9 @@ def describe(settings: dict) -> str:
         return "\n".join(lines + [f"⚠️ {exc}"])
     if settings["model"] == videogen.AUTO:
         lines.append(f"سيُستخدم: {plan.label}")
+    cost = videogen.estimate_cost(plan)
+    if cost is not None:
+        lines.append(f"التكلفة التقريبية: {cost} دولار للمقطع")
     return "\n".join(lines + [f"⚠️ {note}" for note in plan.notes])
 
 

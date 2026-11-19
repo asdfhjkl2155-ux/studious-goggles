@@ -28,6 +28,8 @@ class ModelSpec:
     qualities: tuple[str, ...]  # output resolutions the model can produce
     format_duration: Callable[[int], Any]  # how the endpoint expects the duration value
     send_resolution: bool = True  # False when the model has one fixed resolution
+    # USD per second of video, by resolution, from fal's model pages. Unknown = not compared.
+    prices: dict[str, float] = field(default_factory=dict)
 
 
 # Each model's duration/quality options, as documented by fal at the time of writing.
@@ -36,6 +38,7 @@ MODELS: dict[str, ModelSpec] = {
     "veo": ModelSpec(
         "fal-ai/veo3.1/lite", "Veo 3.1 Lite — جودة عالية مع صوت",
         durations=(4, 6, 8), qualities=("720p", "1080p"), format_duration=lambda s: f"{s}s",
+        prices={"720p": 0.05, "1080p": 0.08},
     ),
     "wan": ModelSpec(
         "wan/v2.6/text-to-video", "Wan 2.6 — حتى 15 ثانية",
@@ -45,6 +48,11 @@ MODELS: dict[str, ModelSpec] = {
         "kling/v4/flash/text-to-video", "Kling 4.0 Flash — حتى 20 ثانية",
         durations=tuple(range(3, 21)), qualities=("720p",), format_duration=int,
         send_resolution=False,
+    ),
+    "ltx": ModelSpec(
+        "fal-ai/ltx-2.3/text-to-video/fast", "LTX 2.3 Fast — الأرخص، 1080p مع صوت",
+        durations=(6, 8, 10), qualities=("1080p",), format_duration=int,
+        prices={"1080p": 0.04},
     ),
 }
 AUTO = "auto"  # pick the fal model that best fits the requested duration and quality
@@ -102,6 +110,35 @@ def is_known_model(model: str) -> bool:
     return model in (AUTO, LOCAL) or model in MODELS or "/" in model
 
 
+def _pick_auto(duration: int, quality: str) -> tuple[ModelSpec, str]:
+    """Pick the model closest to the wanted duration, then the cheapest clip.
+
+    A 1080p-only model may serve a 720p request when its 1080p clip costs less than the
+    720p alternatives: better picture for less money.
+    """
+    options = []
+    for spec in MODELS.values():
+        if quality in spec.qualities:
+            used = quality
+        elif quality == "720p" and "1080p" in spec.prices:
+            used = "1080p"
+        else:
+            continue
+        actual = _nearest(spec.durations, duration)
+        cost = spec.prices.get(used, float("inf")) * actual
+        options.append((abs(actual - duration), cost, spec, used))
+    _, _, spec, used = min(options, key=lambda o: (o[0], o[1]))
+    return spec, used
+
+
+def estimate_cost(plan: "Plan") -> float | None:
+    """Approximate USD cost of a plan, when the model's price is known."""
+    for spec in MODELS.values():
+        if spec.endpoint == plan.endpoint and plan.duration and plan.quality in spec.prices:
+            return round(spec.prices[plan.quality] * plan.duration, 2)
+    return None
+
+
 def make_plan(model: str, duration: int, quality: str) -> Plan:
     """Fit the requested duration and quality to a model. Quality wins over duration."""
     model = model.strip()
@@ -132,15 +169,16 @@ def make_plan(model: str, duration: int, quality: str) -> Plan:
         return Plan(model, model, {}, None, None,
                     ("موديل مخصص: المدة والجودة على افتراضي الموديل.",))
 
+    notes: list[str] = []
     if model == AUTO:
-        candidates = [s for s in MODELS.values() if quality in s.qualities]
-        spec = min(candidates, key=lambda s: abs(_nearest(s.durations, duration) - duration))
+        spec, actual_quality = _pick_auto(duration, quality)
+        if actual_quality != quality:
+            notes.append(f"تم استخدام {actual_quality} بدل {quality} لأنها أرخص هنا "
+                         f"({spec.prices[actual_quality]} دولار للثانية).")
     else:
         spec = MODELS[model]
-
-    notes: list[str] = []
-    actual_quality = quality
-    if quality not in spec.qualities:
+        actual_quality = quality
+    if actual_quality not in spec.qualities:
         actual_quality = spec.qualities[-1]
         notes.append(f"هذا الموديل لا يدعم {quality}، تم استخدام {actual_quality}.")
     actual_duration = _nearest(spec.durations, duration)

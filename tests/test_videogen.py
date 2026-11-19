@@ -53,8 +53,9 @@ def test_extract_video_url_missing():
 
 
 @pytest.mark.parametrize("duration, quality, endpoint, arguments", [
-    (8, "720p", "fal-ai/veo3.1/lite", {"duration": "8s", "resolution": "720p"}),
-    (8, "1080p", "fal-ai/veo3.1/lite", {"duration": "8s", "resolution": "1080p"}),
+    (4, "720p", "fal-ai/veo3.1/lite", {"duration": "4s", "resolution": "720p"}),
+    (8, "1080p", "fal-ai/ltx-2.3/text-to-video/fast", {"duration": 8, "resolution": "1080p"}),
+    (10, "1080p", "fal-ai/ltx-2.3/text-to-video/fast", {"duration": 10, "resolution": "1080p"}),
     (5, "720p", "wan/v2.6/text-to-video", {"duration": "5", "resolution": "720p"}),
     (15, "1080p", "wan/v2.6/text-to-video", {"duration": "15", "resolution": "1080p"}),
     (20, "720p", "kling/v4/flash/text-to-video", {"duration": 20}),
@@ -149,8 +150,8 @@ def test_generate_reports_missing_video_url():
 def test_describe_shows_chosen_model_and_adjustments():
     text = bot.describe({"model": "auto", "aspect": "16:9", "duration": 20, "quality": "1080p"})
     assert "Wan 2.6" in text and "⚠️" in text
-    text = bot.describe({"model": "auto", "aspect": "16:9", "duration": 8, "quality": "720p"})
-    assert "Veo" in text and "⚠️" not in text
+    text = bot.describe({"model": "auto", "aspect": "16:9", "duration": 4, "quality": "720p"})
+    assert "Veo" in text and "⚠️" not in text and "0.2 دولار" in text
 
 
 def test_access_control():
@@ -219,3 +220,21 @@ def test_pairing_code_claims_owner_once_and_saves_it(tmp_path):
     assert "ALLOWED_USER_IDS=42" in env.read_text()
     assert not bot.claim_owner("AB12CD", 99, data)  # the code works only once
     assert data["allowed"] == {42}
+
+
+@pytest.mark.parametrize("duration, endpoint, cost", [
+    (6, "fal-ai/ltx-2.3/text-to-video/fast", 0.24),  # 1080p LTX beats 720p Veo (0.30)
+    (8, "fal-ai/ltx-2.3/text-to-video/fast", 0.32),  # vs Veo 0.40
+    (4, "fal-ai/veo3.1/lite", 0.2),  # LTX cannot do 4s
+])
+def test_auto_upgrades_720p_to_cheaper_1080p(duration, endpoint, cost):
+    plan = videogen.make_plan("auto", duration, "720p")
+    assert plan.endpoint == endpoint and videogen.estimate_cost(plan) == cost
+    if "ltx" in endpoint:
+        assert plan.quality == "1080p" and len(plan.notes) == 1
+
+
+def test_auto_without_a_known_price_keeps_the_old_choice():
+    assert videogen.make_plan("auto", 5, "720p").endpoint == "wan/v2.6/text-to-video"
+    assert videogen.make_plan("auto", 20, "720p").endpoint == "kling/v4/flash/text-to-video"
+    assert videogen.estimate_cost(videogen.make_plan("auto", 5, "720p")) is None
